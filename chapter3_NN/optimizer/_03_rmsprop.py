@@ -1,15 +1,12 @@
-# coding=utf-8
-
 import numpy as np
 import torch
-from torchvision.datasets import MNIST
+from torchvision.datasets import MNIST # 导入 pytorch 内置的 mnist 数据
 from torch.utils.data import DataLoader
 from torch import nn
+from torch.autograd import Variable
 import time
 import matplotlib.pyplot as plt
 
-
-# data transform method, standardize data
 def data_tf(x):
     x = np.array(x, dtype='float32') / 255
     x = (x - 0.5) / 0.5
@@ -17,25 +14,15 @@ def data_tf(x):
     x = torch.from_numpy(x)
     return x
 
-# get train/test data
 train_set = MNIST('./data', train=True, transform=data_tf, download=True)
 test_set = MNIST('./data', train=False, transform=data_tf, download=True)
 
-# define loss function
 criterion = nn.CrossEntropyLoss()
 
-# adapt learning rate for every single gradient
-# define audograd
-def sgd_adagrad_update(parameters, sqrs, lr):
-    eps = 1e-10
-    for (param, sqr) in zip(parameters, sqrs):
-        sqr[:] = sqr + param.data ** 2
-        param.data = param.data - lr * param.grad.data / torch.sqrt(sqr + eps)
 
-
-def train(num_epochs, batch_size, learning_rate, default_optim=False):
+def train(num_epochs, batch_size, learning_rate, alpha, default_optim):
     net = nn.Sequential(
-        nn.Linear(28 * 28, 400),
+        nn.Linear(28*28, 400),
         nn.ReLU(),
         nn.Linear(400, 200),
         nn.ReLU(),
@@ -43,11 +30,17 @@ def train(num_epochs, batch_size, learning_rate, default_optim=False):
     )
 
     train_data = DataLoader(train_set, batch_size=batch_size, shuffle=True)
-    optimizer = torch.optim.Adagrad(net.parameters(), learning_rate)
+    optimizer = torch.optim.RMSprop(net.parameters(), learning_rate, alpha)
 
     sqrs = []
     for param in net.parameters():
         sqrs.append(torch.zeros_like(param.data))
+
+    def sgd_rmsprop(parameters, learning_rate, alpha, sqrs):
+        eps = 1e-10
+        for (param, sqr) in zip(parameters, sqrs):
+            sqr[:] = alpha * sqr + (1 - alpha) * param.data ** 2
+            param.data = param.data - learning_rate * param.grad.data / torch.sqrt(sqr + eps)
 
     losses = []
     start = time.time()
@@ -64,21 +57,22 @@ def train(num_epochs, batch_size, learning_rate, default_optim=False):
             else:
                 net.zero_grad()
                 loss.backward()
-                sgd_adagrad_update(net.parameters(), sqrs, learning_rate)
+                sgd_rmsprop(net.parameters(), learning_rate, alpha, sqrs)
 
-            train_loss += loss.data.item()
             if i % 30 == 29:
                 losses.append(loss.data.item())
-        print("Epoch %s, Train loss: %.6f " % (epoch, train_loss / len(train_data)))
+            train_loss += loss.data.item()
+        print("Epoch %s, Train loss: %.6f" % (epoch, train_loss/len(train_data)))
     end = time.time()
-    print("It takes %s seconds." % (int(end - start)))
+    print("it takes %s seconds." % (int(end - start)))
     return losses
 
-train_losses0 = train(num_epochs=5, batch_size=64, learning_rate=1e-2, default_optim=False)
-train_losses1 = train(num_epochs=5, batch_size=64, learning_rate=1e-2, default_optim=True)
 
-x_axis = np.linspace(0, 5, len(train_losses0), endpoint=True)
-plt.semilogy(x_axis, train_losses0, label='user_defined')
-plt.semilogy(x_axis, train_losses1, label='adagrad')
+train_losses0 = train(num_epochs=5, batch_size=64, learning_rate=1e-2, alpha=0.9, default_optim=False)
+train_losses1 = train(num_epochs=5, batch_size=64, learning_rate=1e-2, alpha=0.9, default_optim=True)
+
+x_axis = np.linspace(0, 5, num=len(train_losses0))
+plt.plot(x_axis, train_losses0, label='user_defined')
+plt.plot(x_axis, train_losses0, label='default')
 plt.legend(loc='best')
 plt.show()

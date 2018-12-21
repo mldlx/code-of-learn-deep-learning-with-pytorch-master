@@ -65,6 +65,7 @@ def train(epoch_nums, batch_size, learning_rate, default_optim=False):
         print("Epoch %s, Train loss: %.6f" % (epoch, train_loss/len(train_data)))
     end = time.time()
     print('it takes %.1f seconds.' % (end - start))
+
     x_axis = np.linspace(0, epoch_nums, len(losses), endpoint=True)
     plt.semilogy(x_axis, losses, label='batch_size=%s' % batch_size)
     plt.legend(loc='best')

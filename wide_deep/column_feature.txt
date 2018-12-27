@@ -1,0 +1,240 @@
+作者：石塔西
+链接：https://zhuanlan.zhihu.com/p/47965313
+来源：知乎
+著作权归作者所有。商业转载请联系作者获得授权，非商业转载请注明出处。
+
+Feature Column是特征预处理器，它和输入数据之间的关系如下图所示
+<img src="https://pic4.zhimg.com/v2-b9a53193151cc982501c3bcd5942e977_b.jpg" data-caption="" data-size="normal" data-rawwidth="1600" data-rawheight="618" class="origin_image zh-lightbox-thumb" width="1600" data-original="https://pic4.zhimg.com/v2-b9a53193151cc982501c3bcd5942e977_r.jpg">
+Feature Column本身并不存储数据，而只是封装了一些预处理的逻辑。比如输入的是字符串(如tag)，把这些字符串根据字典映射成id，再根据id映射成embedding vector，这些预处理逻辑都是由不同的feature column完成的。
+Input_fn返回的dataset可以看成{feature_name: feature tensor}的dict，而每个feature column定义时需要指定一个名字，feature column与input就是通过这个名字联系在一起。
+所有feature column之间的关系如下图所示。其中只有一个numeric_column是纯粹处理数值特征的，其余的都与处理categorical特征有关，从中可以印证，本系列上一篇文章中的观点：categorical特征才是推荐、搜索领域的一等公民。
+<img src="https://pic1.zhimg.com/v2-a3e23974dad9ce5df1e6078d03510fd8_b.jpg" data-size="normal" data-rawwidth="1172" data-rawheight="678" class="origin_image zh-lightbox-thumb" width="1172" data-original="https://pic1.zhimg.com/v2-a3e23974dad9ce5df1e6078d03510fd8_r.jpg">
+Feature Column关系结构在展开之前，有两点需要说明：Feature Column的实现都在tensorflow/python/feature_column/feature_column.py这个module中。
+在接下来的论述中，如果没有特殊说明，所有的类与函数也都是在feature_column.py中这个module中。本文中贴出来的代码，是feature_column.py源代码的删减版本。我删除了一些如异常处理、assert、检查type、logging之类辅助性的代码，使程序的逻辑主线更加清晰。要想学习google代码精髓的同学，请到github上下载完整源码来阅读。基类FeatureColumn, DenseColumn, CategoricalColumn_FeatureColumn是所有feature column的基类。这个基类比较重要的是一个_transform_feature(self, inputs)虚函数，接下来，我们会看到，各子类主要的预处理逻辑都是通过重载这个函数来实现的。
+基类_DenseColumn是所有numeric/dense feature column的基类。其中比较重要的是，get_dense_tensor(self, inputs, …)虚函数，inputs可以理解为从input_fn返回的dict of input tensor的wrapper。Inputs一般是_LazyBuilder类型的，除了实现按列名查找input tensor的功能，还实现了缓存，以避免重复“预处理”。所以get_dense_tensor可以简单理解为：是根据列名从inputs中提出一个Tensor基类_CategoricalColumn有一个_get_sparse_tensors(self, inputs,…)虚函数，也大致是根据列名）从inputs（_LazyBuilder缓存）提取出一个叫做IdWeightPair的namedtuple。IdWeightPair = collections.namedtuple( 'IdWeightPair', ['id_tensor', 'weight_tensor'])
+'id_tensor'和'weight_tensor'是两个indices与dense_shape都完全相同的SparseTensor，只是values不同，id_tensor存储稀疏矩阵indices对应位置上的token_id（integer或string）weight_tensor存储对应token_id的权重（float）比如，如果用如下稀疏矩阵表示一组时间序列，"a:0.5"表示：第0个样本在第1个时间点出现的token=a，而它的权重是0.5[[   , a:0.5,      ]
+ [b:1,      , c:0.9]
+ [   , d:1.5,     ]]
+则以上稀疏矩阵用IdWeightPair表示，id_tensor与weight_tensor的dense_shape都是[2,3]，indices与values如下[0, 1]: <id of 'a'>    [0, 1]: 0.5
+[1, 0]: <id of 'b'>    [1, 0]: 1
+[1, 2]: <id of 'c'>    [1, 2]: 0.9
+[2, 1]: <id of 'd'>    [2, 1]: 1.5
+稀疏矩阵相乘在本系列的第一篇文章论述过，推荐、搜索系统的一个关键词就是大型、稀疏的categorical特征向量。所以，阅读feature column源代码的重点，就是看tensorflow是如何处理这些稀疏的特征向量的。因此，在正式介绍各feature column之前，我们要先了解清楚tensorflow是如何实现稀疏矩阵相乘的，因为后文中要使用到。具体来说，是如何实现“一个稀疏的特征向量”乘以“一个稠密的权重矩阵”。这个操作是非常常见的。embedding的时候。如果稀疏向量只有第i位为1，其余都是0，即One-Hot-Encoding。那么embedding过程，可以用抽取embedding weight矩阵的i行快速实现。但是，在实际系统中，稀疏向量不是OHE，而是Multi-Hot-Encoding，而且每位上的数值也不是binary(0或1)，而是实数值。比如，画像标签系统给人或物打标签，往往要打上多个标签，并且附带对这个标签的置信度。这种情况下，embedding不能再以简单抽取某行来实现了，而必须实现为一个“理论稠密形状”shape=[batch_size, total_tokens ]的稀疏输入矩阵与shape=[total_tokens, embed_dim]的稠密权重矩阵（属于优化变量）的乘积。将稀疏特征接入LR/DNN的时候与embedding类似，这里更是需要实现，一个“理论稠密形状”shape=[batch_size, total_tokens]的稀疏输入矩阵与shape=[total_tokens, embed_dim]的稠密权重矩阵（属于优化变量）的乘积。TensorFlow中提供了两个API来实现一个“稀疏矩阵”与一个“稠密矩阵”相乘的操作：tf.sparse_tensor_dense_matmul(sp_a, b, ……)，sp_a是一个SparseTensor，b是一个Tensor。这里，sp_a的dense_shape必须与b的shape匹配。以embedding为例，sp_a的dense_shape=[batch_size, total_tokens]，而b的shape=[total_tokens, embed_dim]。tf.nn.embedding_lookup_sparse(params, sp_ids, sp_weights)。该函数与sparse_tensor_dense_matmul最大的不同是，稀疏矩阵必须用sp_ids和sp_weights两个SparseTensor来表示，而且sp_ids, sp_weights的形状不必与params代表的稠密矩阵相匹配。以一个feature下有多个<tag:value>需要embedding为例，sp_ids/sp_weights的dense_shape可以是[batch_size, max_tokens_per_example]，而params还必须是[total_token, embed_dim]的形式。embedding_lookup_sparse允许sp_ids中有重复，不要求sp_ids中的id有顺序，允许sp_ids中重复id对应不同权重，使用起来更加方便。而且在前文中提到，_CategoricalColumn有一个_get_sparse_tensors，返回IdWeightPair的namedtuple。IdWeightPair.id_tensor正好对应embedding_lookup_sparse所需要的sp_ids，IdWeightPair.id_tensor恰好对应embedding_lookup_sparse所对应的sp_weights。可以说，embedding_lookup_sparse就是为处理categorical feature column返回的稀疏矩阵而设计的，所以，接下来我们会看到，Wide & Deep的实现过程中，大量用到embedding_lookup_sparse。embedding_lookup_sparse的工作原理：对于sp_ids所对应的稠密矩阵中的每一行embedding_lookup_sparse遍历这一行中所有的有效id(sp_ids中id，对应的都是非零元，所以肯定都是有效id)根据这些有效id，从params中抽取对应的行把抽取出来的行，根据sp_weights中对应的权重聚合（如：加和、平均等）起来假如，params 是一个10x20的稠密矩阵, sp_ids / sp_weights 如下[0, 0]: id 1, weight 2.0
+[0, 1]: id 3, weight 0.5
+[1, 0]: id 0, weight 1.0
+[2, 3]: id 1, weight 3.0
+如果聚合方式选择"mean",则最后的结果是一个3x20的稠密矩阵output[0, :] = (params[1, :] * 2.0 + params[3, :] * 0.5) / (2.0 + 0.5)
+output[1, :] = (params[0, :] * 1.0) / 1.0
+output[2, :] = (params[1, :] * 3.0) / 3.0
+另外，embedding_lookup_sparse在使用过程中存在一些限制，比如它要求输入的稀疏矩阵不能有全为0的行，即每行必须有至少一个非零元。这个限制在实际系统中，很难得到满足。因此，在wide&deep中实际用到的是一个叫safe_embedding_lookup_sparse的函数，这个函数对embedding_lookup_sparse做了一些封装，以处理全零行这样的特殊情况。Numeric Column这是唯一一个专门处理数值特征的feature column。将数值特征接入网络是最没有技术含量的。唯一值得一提的是它允许用户提供一些预处理的逻辑，比如norm_latitude = lambda latitude:(latitude-min_latitude)/delta_latitude - 0.5
+_ = tf.feature_column.numeric_column('latitude', normalizer_fn = norm_latitude)
+Bucketized Column这个函数也没有什么好说的。引入这个函数的初衷很简单，就是DNN在底层依然是一个线性模型，这就限制了数值型特征的表达能力，因为在现实世界中，较少出现特征与label之间呈线性关系的情况。因此，需要对数值特征分桶，将数值特征转化为categorical特征。# A numeric column for the raw input.
+numeric_feature_column = tf.feature_column.numeric_column("Year")
+
+# Bucketize the numeric column on the years 1960, 1980, and 2000
+bucketized_feature_column = tf.feature_column.bucketized_column(
+                           source_column = numeric_feature_column,
+                           boundaries = [1960, 1980, 2000])
+Categorical vocabulary column以前我们在做embedding时，经常要做的一个操作就是，根据一个字典，将样本出现的字符串映射成其对应的int型id。看似简单，但是在映射过程中，要处理生僻字(Out-Of-Vocabulary, OOV)、填充符(Padding)，也很繁琐。现在Feature Column提供了tf.feature_column.categorical_column_with_vocabulary_listtf.feature_column.categorical_column_with_vocabulary_file两个feature column封装了这个映射操作。两个函数很相似，只不过前者的字典是由内存中的一个list来提供，而后者是由一个文字来指定字典。以categorical_column_with_vocabulary_list为例，这个类在feature_column.py中_VocabularyListCategoricalColumn类中实现。去除辅助性代码，我们看到输入的tensor先一律转成sparse，然后调用lookup_ops.index_table_from_tensor完成映射。class _VocabularyListCategoricalColumn():
+	def _num_buckets(self):
+	    # 未来将其接入网络时，连接这个输入的权重的形状=(feature_column._num_buckets, _units)，第一维的长度即=字典长度+OOV桶数
+            return len(self.vocabulary_list) + self.num_oov_buckets
+
+
+        def _transform_feature(self, inputs):
+            # inputs对应的输入可以是Tensor或SparseTensor，形状都是[batch_size, #max_tokens_per_example]以应对一行有多个tag的情况
+            # 即使输入的是Tensor，也会第一时间转化成SparseTensor
+
+	    input_tensor = _to_sparse_input_and_drop_ignore_values(inputs.get(self.key))
+
+            return lookup_ops.index_table_from_tensor(
+			vocabulary_list=tuple(self.vocabulary_list),
+			default_value=self.default_value,
+			num_oov_buckets=self.num_oov_buckets,
+			dtype=key_dtype,
+			name='{}_lookup'.format(self.key)).lookup(input_tensor)
+
+	def _get_sparse_tensors(self, inputs, weight_collections=None, trainable=None):
+	    # 可见即使输入的一行中有多个值，也是id_tensor中出现重复的id，照样没有权重
+            return _CategoricalColumn.IdWeightPair(inputs.get(self), None)
+为了了解这个类的用法，设计了如下的测试用例，主要为了演示：这个类是如何处理一个feature column对应多个值的情况的。这种情况在实际应用中很常见，比如用户的兴趣不可能只有一个，而是由多个tag组成的。从测试结果中可以看到，输入一个[batch_size, max_tokens_per_example]的矩阵，VocabularyListCategoricalColumn输出的稀疏矩阵，其dense_shape依然是[batch_size, max_tokens_per_example]。而且这个稀疏矩阵只有sparse_id，而没有sparse_weight。原始输入中重复的token，映射成sparse_id中重复的id。只有通过indicator_column将[batch_size, max_tokens_per_example]形状的稀疏矩阵变成[batch_size, vocab_size]的稠密矩阵时，重复的token，其出现次数才被加和。这个类是如何处理填充字符的。填充字符（如果是字符串，缺省用’’表示，如果是整型id，用-1表示），无论是在VocabularyListCategoricalColumn还是在indicator_column中都被忽略这个类是如何处理Out-Of-Vocabulary（OOV）的。OOV，在VocabularyListCategoricalColumn中被处理成-1，在indicator_column中都被忽略from tensorflow import feature_column
+from tensorflow.python.feature_column.feature_column import _LazyBuilder
+
+def test_cate_featcol_with_vocablist():
+	# ================== prepare input
+	# 1. 为什么要用b前缀，这是因为通过input_fn读进来的字符串都有b前缀
+	# 而我要测试的是，如果我传入的vocab list是普通的str，能否与这些b匹配成功
+	# 2. '' represents missing, feature_column treats them "ignored in sparse tensor, and ignored in dense tensor"
+	# 3. 'z' represents OOV, feature_column treats them "-1 in sparse tensor, and ignored in dense tensor"
+	# 4. how the duplicates are handled?
+	x_values = {'x': [[b'a', b'z', b'a', b'c'],
+				 [b'b', b'', b'd', b'b']]}
+	builder = _LazyBuilder(x_values) # lazy representation of input
+
+	# ================== define ops
+	sparse_featcol = feature_column.categorical_column_with_vocabulary_list('x', ['a', 'b', 'c'], dtype=tf.string, default_value=-1)
+	x_sparse_tensor = sparse_featcol._get_sparse_tensors(builder)
+
+	#尽管一行中有重复，但是并没有合并，所以压根就没有weight
+	#只是导致id_tensor中会出现重复数值而已，而导致embedding_lookup_sparse时出现累加
+	assert x_sparse_tensor.weight_tensor is None
+
+	# 将形状为[batch_size, max_token_per_example]的sp_ids/sp_weights转换成
+	# 形状为[batch_size, vocab_size]的dense，注意第一行有重复，所以结果应该是multi-hot
+	dense_featcol = feature_column.indicator_column(sparse_featcol)
+	x_dense_tensor = feature_column.input_layer(x_values, [dense_featcol])
+
+	# ================== run
+	with tf.Session() as sess:
+		# 必须initialize table，否则报错
+		sess.run(tf.global_variables_initializer())
+		sess.run(tf.tables_initializer())
+
+		print("************************* sparse tensor")
+		# 结果证明：
+		# 1. 输入数据用b前缀的字符串，能够匹配上vocab list中的str
+		# 2. 注意第二行只有两个元素，''在sparse tensor中被忽略掉了
+		# 3. 'z','d'代表oov，sparse tensor中被映射成-1
+		# 4. sparse_tensor的dense_shape与原始输入的shape相同，都是[batch_size, #time_steps]，同一行的重复元素还在原来的位置上，没有合并
+		# [SparseTensorValue(indices=array([[0, 0],
+		#                                   [0, 1],
+		#                                   [0, 2],
+		#                                   [0, 3],
+		#                                   [1, 0],
+		#                                   [1, 2],
+		#                                   [1, 3]]), values=array([0, -1, 0, 2, 1, -1, 1]), dense_shape=array([2, 4]))]
+		print(sess.run([x_sparse_tensor.id_tensor]))
+
+		print("************************* dense MHE tensor")
+		# 结果证明：
+		# 1. 在dense表示中，duplicates的出现次数被加和，使用MHE
+		# 2. 无论是原始的missing（或许是由padding造成的），还是oov，在dense结果中都不出现
+		# 3. densor tensor的shape=[batch_size, vocab_size]，同一行的相同元素被合并（次数相加）
+		# [array([[2., 0., 1.],
+		#         [0., 2., 0.]], dtype=float32)]
+		print(sess.run([x_dense_tensor]))
+Weighted categorical column在上面的例子中可以看到，VocabularyListCategoricalColumn输出的稀疏矩阵压根就没有sp_weight，也就无法指定权重。而在处理用户画像标签时，画像系统往往除了给用户打下标签，还给每个所打的标签加上了一个概率。比如描述一个用户的兴趣，不是简简单单地说，他爱好军事和历史，而是说他有90%的概率喜欢军事，85%的概率爱好历史，还有15%的概率喜欢八卦。为了能够将sparse_weights也包含进来，所以引入了weighted categorical column这个类。这个类的使用方法，如下所示。from tensorflow import feature_column
+from tensorflow.python.feature_column.feature_column import _LazyBuilder
+
+def test_weighted_cate_column():
+	# !!! id=''代表missing，其对应的weight只能为0，否则会导致id和weight长度不一致而报错
+	# !!! 而且weight必须是float型，输入int会报错
+	x_values = {'id':    [[b'a', b'z', b'a', b'c'],
+			      [b'b', b'', b'd', b'b']],
+		    'weight': [[1.0, 2.0, -3.0, 4.0],
+			       [5.0, 0.0, 7.0, -8.0]]}
+	builder = _LazyBuilder(x_values) # lazy representation of input
+
+	# ================== define ops
+	sparse_id_featcol = feature_column.categorical_column_with_vocabulary_list('id', ['a', 'b', 'c'], dtype=tf.string, default_value=-1)
+	sparse_featcol = feature_column.weighted_categorical_column(categorical_column=sparse_id_featcol,
+	weight_feature_key='weight')
+	x_sparse_tensor = sparse_featcol._get_sparse_tensors(builder)
+
+	# indicator_column将sparse tensor转换成dense MHE格式, shape=[batch_size, #tokens]
+	# 其中的权重是这个token出现的所有权重的总和
+	dense_featcol = feature_column.indicator_column(sparse_featcol)
+	x_dense_tensor = feature_column.input_layer(x_values, [dense_featcol])
+
+	# ================== run
+	with tf.Session() as sess:
+		# 必须initialize table，否则报错
+		sess.run(tf.global_variables_initializer())
+		sess.run(tf.tables_initializer())
+
+		id_sparse_value, weight_sparse_value = sess.run([x_sparse_tensor.id_tensor, x_sparse_tensor.weight_tensor])
+
+		print("************************* sparse id tensor")
+		# sparse tensor's id_tensor保持与原始输入相同的形状，[batch_size, max_tokens_per_example]=[2,4]
+		# 原始数据中的id=''被忽略
+		# SparseTensorValue(indices=array(
+		#        [[0, 0],
+		#         [0, 1],
+		#         [0, 2],
+		#         [0, 3],
+		#         [1, 0],
+		#         [1, 2],
+		#         [1, 3]]), values=array([ 0, -1, 0, 2, 1, -1, 1]), dense_shape=array([2, 4]))
+		print(id_sparse_value)
+
+		print("************************* sparse weight tensor")
+		# sparse tensor's weight_tensor保持与原始输入相同的形状，[batch_size, max_tokens_per_example]=[2,4]
+		# 原始数据中的id=''的weight（必须是0）被忽略
+		# SparseTensorValue(indices=array(
+		#        [[0, 0],
+		#         [0, 1],
+		#         [0, 2],
+		#         [0, 3],
+		#         [1, 0],
+		#         [1, 2],
+		#         [1, 3]]), values=array([ 1., 2., -3., 4., 5., 7., -8.], dtype=float32), dense_shape=array([2, 4]))
+		print(weight_sparse_value)
+
+		print("************************* dense MHE tensor")
+		# indicator_column将sparse tensor按照MHE的方式转化成dense tensor，shape=[batch_size, total_tokens_in_vocab]
+		# 其中的每个数值是该token出现的所有权重的总和
+		# [[-2. 0. 4.]
+		# [ 0. -3. 0.]]
+		print(sess.run(x_dense_tensor))
+Hashed categorical column这个类适用于：一个category下拥有的tag太多的情况。比如要将所有的user_id（亿级别的）进行建模。事先不知道一个category下有多少tag这个类很简单。它的实现是在feature_column.py中的_HashedCategoricalColumn完成的，简化的代码如下。class _HashedCategoricalColumn(_CategoricalColumn,……):
+	def _transform_feature(self, inputs):
+		# 如果inputs[key]已经是sparse tensor，直接返回
+		# 如果inputs[key]是Dense的，则在下面函数中将missing value('' for string, -1 for int)去掉，
+		# 将剩下的数据组成一个Sparse Tensor
+		input_tensor = _to_sparse_input_and_drop_ignore_values(inputs.get(self.key))
+
+		# 所有hash都是按照hash string来完成的
+		if self.dtype == dtypes.string:
+			sparse_values = input_tensor.values
+		else:
+			sparse_values = string_ops.as_string(input_tensor.values)
+
+		sparse_id_values = string_ops.string_to_hash_bucket_fast(sparse_values, self.hash_bucket_size, name='lookup')
+
+		# 返回的SparseTensor与原始输入形状相同，只是value变成了hash后的整数
+		return sparse_tensor_lib.SparseTensor(
+			input_tensor.indices, sparse_id_values, input_tensor.dense_shape)
+
+	def _num_buckets(self):
+		# 接入该列时，与列连接的权重的第一维度长度就是hash_bucket_size
+		return self.hash_bucket_size
+
+	def _get_sparse_tensors(self, inputs, weight_collections=None,trainable=None):
+		return _CategoricalColumn.IdWeightPair(inputs.get(self), None)
+Feature Cross特征交叉很好理解，详细用法见下面的测试用例def test_crossed_column():
+	# ************* define input
+	# 注意''代表空值，'x'这里是OOV
+	x_values = {
+			'price': [['A', '', 'B'], ['B', 'D', 'C'], ['C', '', 'B']],
+			'color': [['R', ''], ['G', 'x'], ['B', 'B']]
+	}
+	builder = _LazyBuilder(x_values) # lazy representation of input
+
+	# ************* define columns
+	price = feature_column.categorical_column_with_vocabulary_list('price',['A', 'B', 'C', 'D'])
+	color = feature_column.categorical_column_with_vocabulary_list('color',['R', 'G', 'B'])
+	col_p_x_c = feature_column.crossed_column([price, color], 16)
+
+	# ************* define ops
+	x_sparse_tensor = col_p_x_c._get_sparse_tensors(builder)
+	assert x_sparse_tensor.weight_tensor is None
+
+	# ************* run
+	with tf.Session() as session:
+		session.run(tf.global_variables_initializer())
+		session.run(tf.tables_initializer())
+		#SparseTensorValue(indices=array(
+		# [[0,0],
+		#  [0,1],
+		#  [1,0],
+		#  [1,1],
+		#  [1,2],
+		#  [1,3],
+		#  [1,4],
+		#  [1,5],
+		#  [2,0],
+		#  [2,1],
+		#  [2,2],
+		#  [2,3]]),values=array([8,1,9,0,4,11,4,14,11,11,13,13]),dense_shape=array([3,6]))
+		print(session.run(x_sparse_tensor.id_tensor))
+从以上结果可以看出对于multi-value的情况，假如col1的vocab-size=size1，col2的vocab-size=size2，则cross的结果，应该是一个dense_shape=[batch_size,  size1*size2]的稀疏矩阵。输入中的空值('' for string, -1 for int)都被排除在外，所以第一个样本cross之后只有2个非零元，第三个样本cross之后只有4个非零元注意由于第三个样本的color值出现重复，导致cross结果也出现2对重复。输入中的OOV也参与cross了，所以第二个样本cross之后有6个值编辑于 2018-10-29
